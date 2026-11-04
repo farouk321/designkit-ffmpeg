@@ -1,0 +1,178 @@
+# LGPL ffmpeg for DesignKit's MP4 export (user ruling D103): one FFmpeg release tag, one openh264 release, one LGPL
+# configure line, four targets. A pushed tag `ffmpeg-<FFMPEG_TAG>-openh264-<OPENH264_VERSION>-r<n>` builds every target,
+# smoke-tests each binary on its own OS, and publishes them with the exact source archives as one release. Release
+# assets are never replaced: a new build is a new tag (r<n+1>).
+#
+# Archive contract (DesignKit packages/cli/src/commands/mp4.ts): `<name>.<zip|tar.xz>` holds `<name>/bin/ffmpeg[.exe]`,
+# a self-contained executable (static: no shared library beside it), plus `<name>/LICENSES/` and `<name>/BUILDINFO.txt`.
+name: build
+
+on:
+  push:
+    tags: ['ffmpeg-*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  FFMPEG_TAG: n9.0.2
+  OPENH264_VERSION: 2.7.0
+  MACOSX_DEPLOYMENT_TARGET: '11.0'
+  # LGPL only: no --enable-gpl / --enable-version3 / --enable-nonfree; nothing autodetected from the build host, so every
+  # target links the same component set (H.264 by libopenh264, BSD-2-Clause); no network, docs, ffplay or ffprobe.
+  CONFIGURE_COMMON: >-
+    --disable-autodetect --disable-doc --disable-ffplay --disable-ffprobe --disable-network --disable-debug
+    --enable-static --disable-shared --enable-libopenh264 --pkg-config-flags=--static
+
+jobs:
+  sources:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Exact source archives
+        run: |
+          set -eu
+          git clone --depth 1 --branch "$FFMPEG_TAG" https://git.ffmpeg.org/ffmpeg.git ffmpeg
+          git clone --depth 1 --branch "v$OPENH264_VERSION" https://github.com/cisco/openh264.git openh264
+          (cd ffmpeg && git archive --format=tar --prefix="ffmpeg-$FFMPEG_TAG/" HEAD | xz -9 > "../ffmpeg-$FFMPEG_TAG-source.tar.xz")
+          (cd openh264 && git archive --format=tar --prefix="openh264-$OPENH264_VERSION/" HEAD | xz -9 > "../openh264-$OPENH264_VERSION-source.tar.xz")
+          echo "ffmpeg $FFMPEG_TAG $(git -C ffmpeg rev-parse HEAD)" > SOURCES.txt
+          echo "openh264 v$OPENH264_VERSION $(git -C openh264 rev-parse HEAD)" >> SOURCES.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sources
+          path: |
+            *-source.tar.xz
+            SOURCES.txt
+
+  linux-x64:
+    needs: sources
+    runs-on: ubuntu-24.04
+    container: alpine:3.20
+    steps:
+      - run: apk add --no-cache build-base nasm pkgconf xz tar perl linux-headers bash git
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: sources }
+      - name: Build (musl, fully static)
+        run: |
+          set -eu
+          tar -xf "openh264-$OPENH264_VERSION-source.tar.xz"
+          tar -xf "ffmpeg-$FFMPEG_TAG-source.tar.xz"
+          P="$PWD/prefix"
+          make -C "openh264-$OPENH264_VERSION" -j"$(nproc)" OS=linux ARCH=x86_64 PREFIX="$P" install-static
+          export PKG_CONFIG_PATH="$P/lib/pkgconfig"
+          cd "ffmpeg-$FFMPEG_TAG"
+          ./configure $CONFIGURE_COMMON --extra-cflags="-I$P/include" --extra-ldflags="-L$P/lib -static" \
+            --extra-ldexeflags=-static --extra-libs="-lstdc++ -lpthread -lm"
+          make -j"$(nproc)"
+      - name: Package
+        run: bash -eu .github/scripts/package.sh linux-x64 "ffmpeg-$FFMPEG_TAG/ffmpeg" tar.xz
+      - uses: actions/upload-artifact@v4
+        with: { name: linux-x64, path: 'dist/*' }
+
+  win32-x64:
+    needs: sources
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y mingw-w64 nasm pkg-config xz-utils zip
+      - name: Use the posix-thread mingw toolchain (C++ std::thread for openh264)
+        run: |
+          sudo update-alternatives --set x86_64-w64-mingw32-gcc /usr/bin/x86_64-w64-mingw32-gcc-posix
+          sudo update-alternatives --set x86_64-w64-mingw32-g++ /usr/bin/x86_64-w64-mingw32-g++-posix
+      - uses: actions/download-artifact@v4
+        with: { name: sources }
+      - name: Build (mingw-w64 cross, fully static)
+        run: |
+          set -eu
+          tar -xf "openh264-$OPENH264_VERSION-source.tar.xz"
+          tar -xf "ffmpeg-$FFMPEG_TAG-source.tar.xz"
+          P="$PWD/prefix"
+          make -C "openh264-$OPENH264_VERSION" -j"$(nproc)" OS=mingw_nt ARCH=x86_64 \
+            CC=x86_64-w64-mingw32-gcc CXX=x86_64-w64-mingw32-g++ AR=x86_64-w64-mingw32-ar PREFIX="$P" install-static
+          export PKG_CONFIG_PATH="$P/lib/pkgconfig" PKG_CONFIG_LIBDIR="$P/lib/pkgconfig"
+          cd "ffmpeg-$FFMPEG_TAG"
+          ./configure $CONFIGURE_COMMON --target-os=mingw32 --arch=x86_64 --cross-prefix=x86_64-w64-mingw32- \
+            --enable-cross-compile --pkg-config=pkg-config --extra-cflags="-I$P/include" \
+            --extra-ldflags="-L$P/lib -static -static-libgcc -static-libstdc++" --extra-libs="-lstdc++ -lpthread"
+          make -j"$(nproc)"
+      - name: Package
+        run: bash -eu .github/scripts/package.sh win32-x64 "ffmpeg-$FFMPEG_TAG/ffmpeg.exe" zip
+      - uses: actions/upload-artifact@v4
+        with: { name: win32-x64, path: 'dist/*' }
+
+  darwin:
+    needs: sources
+    strategy:
+      matrix:
+        include:
+          - { platform: darwin-arm64, runner: macos-15, arch: arm64 }
+          - { platform: darwin-x64, runner: macos-15-intel, arch: x86_64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install nasm pkg-config xz
+      - uses: actions/download-artifact@v4
+        with: { name: sources }
+      - name: Build (static ffmpeg + openh264; system libc++ only)
+        run: |
+          set -eu
+          tar -xf "openh264-$OPENH264_VERSION-source.tar.xz"
+          tar -xf "ffmpeg-$FFMPEG_TAG-source.tar.xz"
+          P="$PWD/prefix"
+          make -C "openh264-$OPENH264_VERSION" -j"$(sysctl -n hw.ncpu)" OS=darwin ARCH=${{ matrix.arch }} PREFIX="$P" install-static
+          export PKG_CONFIG_PATH="$P/lib/pkgconfig" PKG_CONFIG_LIBDIR="$P/lib/pkgconfig"
+          cd "ffmpeg-$FFMPEG_TAG"
+          ./configure $CONFIGURE_COMMON --extra-cflags="-I$P/include" --extra-ldflags="-L$P/lib" --extra-libs="-lc++"
+          make -j"$(sysctl -n hw.ncpu)"
+      - name: Package
+        run: bash -eu .github/scripts/package.sh ${{ matrix.platform }} "ffmpeg-$FFMPEG_TAG/ffmpeg" tar.xz
+      - uses: actions/upload-artifact@v4
+        with: { name: '${{ matrix.platform }}', path: 'dist/*' }
+
+  smoke:
+    needs: [linux-x64, win32-x64, darwin]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux-x64, runner: ubuntu-24.04 }
+          - { platform: win32-x64, runner: windows-2025 }
+          - { platform: darwin-arm64, runner: macos-15 }
+          - { platform: darwin-x64, runner: macos-15-intel }
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: '${{ matrix.platform }}', path: dist }
+      - name: Encode twice, byte-identical, LGPL, no shared library
+        run: bash -eu .github/scripts/smoke.sh "${{ matrix.platform }}"
+
+  release:
+    needs: [sources, smoke]
+    if: startsWith(github.ref, 'refs/tags/ffmpeg-')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: all, merge-multiple: true }
+      - name: Tag names the pinned versions
+        run: |
+          set -eu
+          case "$GITHUB_REF_NAME" in
+            "ffmpeg-$FFMPEG_TAG-openh264-$OPENH264_VERSION-r"[0-9]*) ;;
+            *) echo "tag $GITHUB_REF_NAME does not name ffmpeg-$FFMPEG_TAG-openh264-$OPENH264_VERSION-r<n>"; exit 1 ;;
+          esac
+      - name: Checksums
+        run: cd all && sha256sum ffmpeg-* openh264-* > SHA256SUMS && cat SHA256SUMS
+      - name: Publish (never replaces an existing release)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          cd all
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" \
+            --notes-file SOURCES.txt ffmpeg-* openh264-* SOURCES.txt SHA256SUMS
