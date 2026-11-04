@@ -26,10 +26,10 @@ cp "openh264-$OPENH264_VERSION/LICENSE" "stage/$name/LICENSES/openh264-LICENSE"
   grep '#define CONFIG_NONFREE ' "$src/config.h"
 } > "stage/$name/BUILDINFO.txt"
 cat "stage/$name/BUILDINFO.txt"
-grep -q '#define CONFIG_GPL 0' "$src/config.h"
-grep -q '#define CONFIG_NONFREE 0' "$src/config.h"
-grep -q '#define CONFIG_VERSION3 0' "$src/config.h"
-grep -q '#define CONFIG_LIBOPENH264_ENCODER 1' "$src/config.h"
+for want in 'CONFIG_GPL 0' 'CONFIG_NONFREE 0' 'CONFIG_VERSION3 0' 'CONFIG_LIBOPENH264_ENCODER 1'; do
+  # component switches live in config_components.h (FFmpeg >= 6), the licence switches in config.h
+  cat "$src/config.h" "$src/config_components.h" | grep -q "#define $want\$" || { echo "config lacks: $want"; exit 1; }
+done
 cd stage
 if [ "$format" = zip ]; then
   zip -r -X -9 "../dist/$name.zip" "$name"
